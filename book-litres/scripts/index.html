@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Book LitRes Debug v2</title>
+</head>
+<body>
+<script>
+"use strict";
+
+const TIMEOUT_MS = 20000;
+const MAX_DEBUG_BODY = 3500;
+const MAX_TOTAL = 30000;
+
+function clean(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeIsbn(s) {
+  const value = clean(s);
+  if (!value) return "";
+
+  const bad = new Set([
+    "n/a","na","none","null","unknown",
+    "нет","неизвестно","-"
+  ]);
+
+  if (bad.has(value.toLowerCase())) return "";
+
+  const compact = value.replace(/[^0-9Xx]/g, "");
+  if (compact.length !== 10 && compact.length !== 13) return "";
+
+  return compact;
+}
+
+async function fetchWithTimeout(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "Accept": "text/plain, text/markdown;q=0.9, text/html;q=0.8, */*;q=0.1"
+      }
+    });
+
+    const text = await response.text();
+
+    return {
+      ok: response.ok,
+      status: response.status,
+      url: response.url || url,
+      text
+    };
+
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchReader(url) {
+  const wrapped = "https://r.jina.ai/" + url;
+  return await fetchWithTimeout(wrapped);
+}
+
+function normalizeLitresUrl(url) {
+  try {
+    const u = new URL(url);
+
+    if (!/(^|\.)litres\.ru$/i.test(u.hostname)) return "";
+
+    u.hash = "";
+    u.search = "";
+
+    let path = u.pathname;
+
+    if (!/^\/book\//i.test(path)) return "";
+
+    path = path.replace(/\/reviews\/?$/i, "/");
+    path = path.replace(/\/+$/, "/");
+    u.pathname = path;
+
+    return u.toString();
+
+  } catch (_) {
+    return "";
+  }
+}
+
+function extractLitresBookLinks(text) {
+  const result = [];
+  const seen = new Set();
+  let match;
+
+  const patterns = [
+    /\[([^\]]{1,300})\]\((https?:\/\/(?:www\.)?litres\.ru\/book\/[^)\s]+)\)/gi,
+    /(https?:\/\/(?:www\.)?litres\.ru\/book\/[^\s)"'<>\]]+)/gi,
+    /(https?:\\\/\\\/(?:www\.)?litres\.ru\\\/book\\\/[^"'\s]+)/gi
+  ];
+
+  for (let i = 0; i < patterns.length; i++) {
+    const re = patterns[i];
+
+    while ((match = re.exec(text)) !== null) {
+      let label = "";
+      let rawUrl = "";
+
+      if (i === 0) {
+        label = clean(match[1]);
+        rawUrl = match[2];
+      } else {
+        rawUrl = match[1];
+      }
+
+      rawUrl = rawUrl.replace(/\\\//g, "/");
+
+      const url = normalizeLitresUrl(rawUrl);
+
+      if (!url || seen.has(url)) continue;
+
+      seen.add(url);
+      result.push({ label, url, pattern: i + 1 });
+    }
+  }
+
+  return result;
+}
+
+function prettyLinks(links) {
+  if (!links.length) return "(none)";
+
+  return links.slice(0, 10).map((x, i) =>
+    `${i + 1}. pattern=${x.pattern} label="${x.label}" url=${x.url}`
+  ).join("\n");
+}
+
+function debugSection(name, reqUrl, res, links) {
+  const body = String(res.text || "");
+
+  return [
+    `=== ${name} ===`,
+    `REQUEST URL: ${reqUrl}`,
+    `HTTP OK: ${res.ok}`,
+    `HTTP STATUS: ${res.status}`,
+    `FINAL URL: ${res.url}`,
+    `RESPONSE LENGTH: ${body.length}`,
+    `EXTRACTED LITRES LINKS: ${links.length}`,
+    prettyLinks(links),
+    "",
+    `FIRST ${MAX_DEBUG_BODY} CHARS:`,
+    body.slice(0, MAX_DEBUG_BODY),
+    ""
+  ].join("\n");
+}
+
+window["ai_edge_gallery_get_result"] = async function(data) {
+  try {
+    const input = typeof data === "string" ? JSON.parse(data) : data;
+
+    const title = clean(input && input.title);
+    const author = clean(input && input.author);
+    const isbn = normalizeIsbn(input && input.isbn);
+
+    const queryTitleAuthor =
+      'site:litres.ru/book/ "' + title + '" "' + author + '"';
+
+    const queryTitle =
+      'site:litres.ru/book/ "' + title + '"';
+
+    const queryLoose =
+      "site:litres.ru/book/ " + title + " " + author;
+
+    const litresQuery =
+      [title, author].filter(Boolean).join(" ");
+
+    const requests = [
+      {
+        name: "BING TITLE + AUTHOR",
+        url: "https://www.bing.com/search?q=" + encodeURIComponent(queryTitleAuthor)
+      },
+      {
+        name: "BING TITLE ONLY",
+        url: "https://www.bing.com/search?q=" + encodeURIComponent(queryTitle)
+      },
+      {
+        name: "BING LOOSE",
+        url: "https://www.bing.com/search?q=" + encodeURIComponent(queryLoose)
+      },
+      {
+        name: "LITRES SEARCH TITLE + AUTHOR",
+        url: "https://www.litres.ru/search/?q=" + encodeURIComponent(litresQuery)
+      },
+      {
+        name: "LITRES SEARCH TITLE",
+        url: "https://www.litres.ru/search/?q=" + encodeURIComponent(title)
+      }
+    ];
+
+    if (isbn) {
+      requests.push({
+        name: "BING ISBN",
+        url: "https://www.bing.com/search?q=" +
+             encodeURIComponent("site:litres.ru/book/ " + isbn)
+      });
+    }
+
+    const allLinks = [];
+    const seen = new Set();
+    const debug = [];
+
+    for (const item of requests) {
+      try {
+        const res = await fetchReader(item.url);
+        const links = extractLitresBookLinks(res.text || "");
+
+        debug.push(debugSection(item.name, item.url, res, links));
+
+        for (const link of links) {
+          if (!seen.has(link.url)) {
+            seen.add(link.url);
+            allLinks.push(link);
+          }
+        }
+
+      } catch (e) {
+        debug.push([
+          `=== ${item.name} ===`,
+          `REQUEST URL: ${item.url}`,
+          `FETCH ERROR: ${e && e.message ? e.message : String(e)}`,
+          ""
+        ].join("\n"));
+      }
+    }
+
+    const summary = [
+      "DEBUG BOOK-LITRES",
+      "",
+      "INPUT",
+      `title: ${title || "(empty)"}`,
+      `author: ${author || "(empty)"}`,
+      `isbn: ${isbn || "(empty)"}`,
+      "",
+      "UNIQUE LITRES BOOK URLS FOUND",
+      allLinks.length ? prettyLinks(allLinks) : "(none)",
+      "",
+      ...debug,
+      "",
+      "END DEBUG BOOK-LITRES"
+    ].join("\n");
+
+    return JSON.stringify({
+      result: summary.slice(0, MAX_TOTAL)
+    });
+
+  } catch (e) {
+    return JSON.stringify({
+      result: [
+        "DEBUG BOOK-LITRES",
+        "",
+        "FATAL ERROR",
+        e && e.stack ? e.stack : String(e),
+        "",
+        "END DEBUG BOOK-LITRES"
+      ].join("\n")
+    });
+  }
+};
+
+</script>
+</body>
+</html>
