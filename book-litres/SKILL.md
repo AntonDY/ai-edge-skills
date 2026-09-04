@@ -15,7 +15,8 @@ Use this skill when the user:
 - asks to summarize LitRes reader reviews;
 - asks for the LitRes rating or number of reviews.
 
-The multimodal model should identify the book from the image first, then use the JavaScript tool to search LitRes.
+The multimodal model should identify the book from the image first,
+then use the JavaScript tool to search LitRes.
 
 ---
 
@@ -31,15 +32,46 @@ Extract, when visible:
 
 Do not invent unreadable text.
 
-If some text is partially unreadable, use the most likely interpretation only when confidence is reasonably high.
+If some text is partially unreadable, use the most likely interpretation
+only when confidence is reasonably high.
 
-If the title or author is uncertain, remember that uncertainty and mention it in the final answer.
+If the title or author is uncertain, remember that uncertainty and
+mention it in the final answer.
 
-If no image is attached but the user already provided the book title and/or author in text, use those values directly.
+If no image is attached but the user already provided the book title
+and/or author in text, use those values directly.
 
 ---
 
-## Step 2 — Search LitRes
+## Step 2 — Normalize book information
+
+Before calling the JavaScript tool, prepare:
+
+- `title`
+- `author`
+- `isbn`
+- `language`
+
+For unknown or unreadable ISBN, always use an empty string:
+
+`"isbn": ""`
+
+Never use placeholder values such as:
+
+- `"N/A"`
+- `"NA"`
+- `"unknown"`
+- `"none"`
+- `"null"`
+- `"нет"`
+- `"неизвестно"`
+- `"-"`
+
+Do not invent an ISBN.
+
+---
+
+## Step 3 — Search LitRes
 
 Call the `run_js` tool.
 
@@ -54,6 +86,6 @@ The JSON must have exactly these fields:
 {
   "title": "book title",
   "author": "author name",
-  "isbn": "ISBN or empty string",
+  "isbn": "",
   "language": "ru"
 }
