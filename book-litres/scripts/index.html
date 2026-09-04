@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Book LitRes v3</title>
+</head>
+<body>
+<script>
+"use strict";
+
+const TIMEOUT_MS = 20000;
+const MAX_REVIEW_EVIDENCE = 7000;
+const MAX_BOOK_EVIDENCE = 5000;
+
+function clean(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeIsbn(s) {
+  const value = clean(s);
+  if (!value) return "";
+
+  const bad = new Set([
+    "n/a","na","none","null","unknown",
+    "нет","неизвестно","-"
+  ]);
+
+  if (bad.has(value.toLowerCase())) return "";
+
+  const compact = value.replace(/[^0-9Xx]/g, "");
+  if (compact.length !== 10 && compact.length !== 13) return "";
+
+  return compact;
+}
+
+async function fetchText(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "Accept": "text/plain, text/markdown;q=0.9, text/html;q=0.8, */*;q=0.1"
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error("HTTP " + response.status);
+    }
+
+    return await response.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function viaJina(url) {
+  return await fetchText("https://r.jina.ai/" + url);
+}
+
+function normalizeLitresUrl(url) {
+  try {
+    let raw = String(url || "")
+      .replace(/\\\//g, "/")
+      .replace(/[)\],.;]+$/g, "");
+
+    const u = new URL(raw);
+
+    if (!/(^|\.)litres\.ru$/i.test(u.hostname)) return "";
+    if (!/^\/book\//i.test(u.pathname)) return "";
+
+    u.hash = "";
+    u.search = "";
+
+    let path = u.pathname
+      .replace(/\/reviews\/?$/i, "/")
+      .replace(/\/+$/, "/");
+
+    u.pathname = path;
+
+    return u.toString();
+  } catch (_) {
+    return "";
+  }
+}
+
+function extractLitresLinks(text) {
+  const out = [];
+  const seen = new Set();
+  const source = String(text || "");
+
+  const patterns = [
+    /\[([^\]]{1,300})\]\((https?:\/\/(?:www\.)?litres\.ru\/book\/[^)\s]+)\)/gi,
+    /(https?:\/\/(?:www\.)?litres\.ru\/book\/[^\s)"'<>\]]+)/gi,
+    /(https?:\\\/\\\/(?:www\.)?litres\.ru\\\/book\\\/[^"'\s]+)/gi
+  ];
+
+  for (let p = 0; p < patterns.length; p++) {
+    let m;
+
+    while ((m = patterns[p].exec(source)) !== null) {
+      const label = p === 0 ? clean(m[1]) : "";
+      const raw = p === 0 ? m[2] : m[1];
+      const url = normalizeLitresUrl(raw);
+
+      if (!url || seen.has(url)) continue;
+
+      seen.add(url);
+      out.push({ label, url });
+    }
+  }
+
+  return out;
+}
+
+function tokens(s) {
+  return clean(s)
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(x => x.length >= 2);
+}
+
+function scoreCandidate(item, title, author) {
+  const label = clean(item.label).toLowerCase();
+  const titleTokens = tokens(title);
+  const authorTokens = tokens(author);
+
+  let score = 0;
+  let titleMatches = 0;
+  let authorMatches = 0;
+
+  for (const t of titleTokens) {
+    if (label.includes(t)) {
+      titleMatches++;
+      score += 10;
+    }
+  }
+
+  for (const t of authorTokens) {
+    if (label.includes(t)) {
+      authorMatches++;
+      score += 7;
+    }
+  }
+
+  if (titleTokens.length && titleMatches / titleTokens.length >= 0.7) score += 40;
+  if (titleTokens.length && titleMatches === titleTokens.length) score += 25;
+  if (authorTokens.length && authorMatches > 0) score += 15;
+  if (authorTokens.length && authorMatches === authorTokens.length) score += 20;
+
+  return score;
+}
+
+async function searchBook(title, author, isbn) {
+  const queries = [];
+
+  if (title && author) {
+    queries.push(
+      'site:litres.ru/book/ "' + title + '" "' + author + '"'
+    );
+  }
+
+  if (title) {
+    queries.push(
+      'site:litres.ru/book/ "' + title + '"'
+    );
+  }
+
+  if (title && author) {
+    queries.push(
+      "site:litres.ru/book/ " + title + " " + author
+    );
+  }
+
+  if (isbn) {
+    queries.push(
+      "site:litres.ru/book/ " + isbn
+    );
+  }
+
+  const collected = [];
+  const seen = new Set();
+
+  for (const query of queries) {
+    const bingUrl =
+      "https://www.bing.com/search?q=" +
+      encodeURIComponent(query);
+
+    try {
+      const text = await viaJina(bingUrl);
+      const links = extractLitresLinks(text);
+
+      for (const link of links) {
+        if (!seen.has(link.url)) {
+          seen.add(link.url);
+          collected.push(link);
+        }
+      }
+    } catch (_) {
+      // Keep trying other queries.
+    }
+  }
+
+  const ranked = collected
+    .map(item => ({
+      ...item,
+      score: scoreCandidate(item, title, author)
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  return ranked;
+}
+
+function reviewsUrl(bookUrl) {
+  return bookUrl.replace(/\/+$/, "") + "/reviews/";
+}
+
+function pickUsefulText(text, maxChars) {
+  const src = String(text || "");
+  const lines = src.split(/\r?\n/);
+  const keep = [];
+
+  const interesting =
+    /рейтинг|оценк|отзыв|читател|звезд|звёзд|автор|назван|книга|rating|review/i;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = clean(lines[i]);
+    if (!line) continue;
+
+    if (interesting.test(line)) {
+      for (let j = Math.max(0, i - 1); j <= Math.min(lines.length - 1, i + 8); j++) {
+        const x = clean(lines[j]);
+        if (x) keep.push(x);
+      }
+    }
+  }
+
+  const dedup = [];
+  const seen = new Set();
+
+  for (const x of keep) {
+    if (!seen.has(x)) {
+      seen.add(x);
+      dedup.push(x);
+    }
+  }
+
+  const chosen = dedup.join("\n") || src;
+  return chosen.slice(0, maxChars);
+}
+
+function extractStats(text) {
+  const src = clean(text);
+
+  const result = {
+    rating: "",
+    ratingsCount: "",
+    reviewsCount: ""
+  };
+
+  let m;
+
+  m = src.match(/(?:рейтинг|rating)\D{0,20}([0-5](?:[.,]\d{1,2})?)/i);
+  if (m) result.rating = m[1].replace(",", ".");
+
+  m = src.match(/(\d[\d\s\u00a0]*)\s+(?:оценк(?:а|и|ок)?|ratings?)/i);
+  if (m) result.ratingsCount = m[1].replace(/\s|\u00a0/g, "");
+
+  m = src.match(/(\d[\d\s\u00a0]*)\s+(?:отзыв(?:а|ов)?|reviews?)/i);
+  if (m) result.reviewsCount = m[1].replace(/\s|\u00a0/g, "");
+
+  return result;
+}
+
+window["ai_edge_gallery_get_result"] = async function(data) {
+  try {
+    const input = typeof data === "string" ? JSON.parse(data) : data;
+
+    const title = clean(input && input.title);
+    const author = clean(input && input.author);
+    const isbn = normalizeIsbn(input && input.isbn);
+
+    if (!title) {
+      return JSON.stringify({
+        found: false,
+        error: "No title was provided."
+      });
+    }
+
+    const candidates = await searchBook(title, author, isbn);
+
+    if (!candidates.length) {
+      return JSON.stringify({
+        found: false,
+        title,
+        author,
+        isbn,
+        reason: "No LitRes book URL could be extracted from search results."
+      });
+    }
+
+    const best = candidates[0];
+    const bookUrl = best.url;
+    const reviewUrl = reviewsUrl(bookUrl);
+
+    let bookText = "";
+    let reviewText = "";
+
+    try {
+      bookText = await viaJina(bookUrl);
+    } catch (_) {}
+
+    try {
+      reviewText = await viaJina(reviewUrl);
+    } catch (_) {}
+
+    const stats = extractStats(bookText + "\n" + reviewText);
+
+    const payload = {
+      found: true,
+      title,
+      author,
+      isbn,
+      bookUrl,
+      reviewsUrl: reviewUrl,
+      searchScore: best.score,
+      rating: stats.rating,
+      ratingsCount: stats.ratingsCount,
+      reviewsCount: stats.reviewsCount,
+      bookEvidence: pickUsefulText(bookText, MAX_BOOK_EVIDENCE),
+      reviewEvidence: pickUsefulText(reviewText, MAX_REVIEW_EVIDENCE)
+    };
+
+    return JSON.stringify(payload);
+
+  } catch (e) {
+    return JSON.stringify({
+      found: false,
+      error: e && e.message ? e.message : String(e)
+    });
+  }
+};
+
+</script>
+</body>
+</html>
