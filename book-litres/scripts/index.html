@@ -1,99 +1,373 @@
 <!doctype html>
-<meta charset="utf-8">
+<html>
+<head>
+  <meta charset="utf-8">
+</head>
+<body>
 <script>
-const clean=s=>String(s||"").replace(/\s+/g," ").trim();
+"use strict";
 
-async function txt(url){
-  const r=await fetch("https://r.jina.ai/"+url);
-  if(!r.ok) throw new Error("HTTP "+r.status);
+const MAX_TEXT = 9000;
+
+function clean(s) {
+  return String(s || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function fetchReader(url) {
+  const r = await fetch("https://r.jina.ai/" + url);
+
+  if (!r.ok) {
+    throw new Error("HTTP " + r.status + " for " + url);
+  }
+
   return await r.text();
 }
 
-function links(md){
-  const a=[], seen=new Set();
-  const re=/\[([^\]]+)\]\((https?:\/\/(?:www\.)?litres\.ru\/book\/[^)\s]+)\)/g;
-  let m;
+function normalizeLitresUrl(url) {
+  try {
+    const u = new URL(url);
 
-  while((m=re.exec(md))){
-    let u=m[2]
-      .split("#")[0]
-      .split("?")[0]
-      .replace(/\/reviews\/?$/,"/")
-      .replace(/\/?$/,"/");
-
-    if(!seen.has(u)){
-      seen.add(u);
-      a.push({name:clean(m[1]),url:u});
+    if (!/(^|\.)litres\.ru$/i.test(u.hostname)) {
+      return "";
     }
+
+    u.search = "";
+    u.hash = "";
+
+    let p = u.pathname;
+
+    // Нас интересуют только карточки книг.
+    if (!p.startsWith("/book/")) {
+      return "";
+    }
+
+    p = p
+      .replace(/\/reviews\/?$/i, "/")
+      .replace(/\/+$/, "/");
+
+    u.pathname = p;
+
+    return u.toString();
+  } catch (_) {
+    return "";
   }
-  return a;
 }
 
-window.ai_edge_gallery_get_result=async(data)=>{
-  try{
-    const x=JSON.parse(data||"{}");
-    const title=clean(x.title);
-    const author=clean(x.author);
-    const isbn=clean(x.isbn);
+function extractLitresBookLinks(text) {
+  const result = [];
+  const seen = new Set();
 
-    if(!title&&!isbn){
-      return JSON.stringify({
-        error:"Не удалось определить название или ISBN."
-      });
+  /*
+   * r.jina.ai обычно преобразует ссылки HTML в Markdown:
+   * [Название](https://www.litres.ru/book/...)
+   */
+  const md =
+    /\[([^\]]{1,300})\]\((https?:\/\/(?:www\.)?litres\.ru\/book\/[^)\s]+)\)/gi;
+
+  let m;
+
+  while ((m = md.exec(text)) !== null) {
+    const url = normalizeLitresUrl(m[2]);
+
+    if (!url || seen.has(url)) {
+      continue;
     }
 
-    const q='site:litres.ru/book/ '+
-      [title,author,isbn]
-        .filter(Boolean)
-        .map(v=>'"'+v.replace(/"/g,"")+'"')
-        .join(" ");
+    seen.add(url);
 
-    const serp=await txt(
-      "https://www.bing.com/search?q="+encodeURIComponent(q)
-    );
+    result.push({
+      label: clean(m[1]),
+      url
+    });
+  }
 
-    const found=links(serp);
+  /*
+   * Дополнительный вариант на случай, если ссылка
+   * встретилась в тексте без Markdown-разметки.
+   */
+  const plain =
+    /https?:\/\/(?:www\.)?litres\.ru\/book\/[^\s)"'<]+/gi;
 
-    if(!found.length){
-      return JSON.stringify({
-        result:"Страница книги на LitRes не найдена. Не придумывай рейтинг или отзывы."
-      });
+  while ((m = plain.exec(text)) !== null) {
+    const url = normalizeLitresUrl(m[0]);
+
+    if (!url || seen.has(url)) {
+      continue;
     }
 
-    const best=found[0];
-    const reviews=best.url.replace(/\/$/,"")+"/reviews/";
+    seen.add(url);
 
-    const pages=await Promise.allSettled([
-      txt(best.url),
-      txt(reviews)
+    result.push({
+      label: "",
+      url
+    });
+  }
+
+  return result;
+}
+
+function tokens(s) {
+  return clean(s)
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(x => x.length >= 2);
+}
+
+function scoreCandidate(item, title, author, isbn) {
+  const hay =
+    (item.label + " " + decodeURIComponent(item.url))
+      .toLowerCase();
+
+  let score = 0;
+
+  for (const t of tokens(title)) {
+    if (hay.includes(t)) {
+      score += 4;
+    }
+  }
+
+  for (const t of tokens(author)) {
+    if (hay.includes(t)) {
+      score += 3;
+    }
+  }
+
+  if (isbn && hay.includes(isbn.replace(/[-\s]/g, ""))) {
+    score += 15;
+  }
+
+  return score;
+}
+
+async function searchLitres(title, author, isbn) {
+  const q = [title, author, isbn]
+    .filter(Boolean)
+    .join(" ");
+
+  /*
+   * Сначала ищем самим поиском LitRes.
+   *
+   * r.jina.ai получает страницу вместо WebView,
+   * поэтому нас не беспокоит CORS LitRes.
+   */
+  const searchUrls = [
+    "https://www.litres.ru/search/?q=" +
+      encodeURIComponent(q),
+
+    /*
+     * Иногда полезнее искать только название,
+     * если полный запрос оказался слишком строгим.
+     */
+    "https://www.litres.ru/search/?q=" +
+      encodeURIComponent(title),
+
+    /*
+     * Резервный поиск через Bing.
+     */
+    "https://www.bing.com/search?q=" +
+      encodeURIComponent(
+        'site:litres.ru/book/ "' +
+        title +
+        '" "' +
+        author +
+        '"'
+      )
+  ];
+
+  let all = [];
+  const seen = new Set();
+  const diagnostics = [];
+
+  for (const url of searchUrls) {
+    try {
+      const page = await fetchReader(url);
+
+      diagnostics.push(
+        "OK: " + url + " (" + page.length + " chars)"
+      );
+
+      const links = extractLitresBookLinks(page);
+
+      for (const item of links) {
+        if (!seen.has(item.url)) {
+          seen.add(item.url);
+          all.push(item);
+        }
+      }
+
+    } catch (e) {
+      diagnostics.push(
+        "ERROR: " + url + " : " + e.message
+      );
+    }
+  }
+
+  all = all
+    .map(x => ({
+      ...x,
+      score: scoreCandidate(
+        x,
+        title,
+        author,
+        isbn
+      )
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  return {
+    query: q,
+    results: all.slice(0, 10),
+    diagnostics
+  };
+}
+
+async function getBookPages(bookUrl) {
+  const reviewsUrl =
+    bookUrl.replace(/\/+$/, "") + "/reviews/";
+
+  const [bookRes, reviewsRes] =
+    await Promise.allSettled([
+      fetchReader(bookUrl),
+      fetchReader(reviewsUrl)
     ]);
 
-    const book=
-      pages[0].status==="fulfilled" ? pages[0].value : "";
+  return {
+    bookUrl,
+    reviewsUrl,
 
-    const rev=
-      pages[1].status==="fulfilled" ? pages[1].value : "";
+    bookText:
+      bookRes.status === "fulfilled"
+        ? bookRes.value
+        : "",
+
+    reviewsText:
+      reviewsRes.status === "fulfilled"
+        ? reviewsRes.value
+        : ""
+  };
+}
+
+window["ai_edge_gallery_get_result"] =
+async (data) => {
+
+  try {
+
+    const input =
+      typeof data === "string"
+        ? JSON.parse(data)
+        : data;
+
+    const title = clean(input.title);
+    const author = clean(input.author);
+    const isbn = clean(input.isbn);
+
+    if (!title && !isbn) {
+      return JSON.stringify({
+        error:
+          "Не получено название книги или ISBN."
+      });
+    }
+
+    const search =
+      await searchLitres(
+        title,
+        author,
+        isbn
+      );
+
+    if (!search.results.length) {
+
+      return JSON.stringify({
+        result: [
+          "Книга не найдена.",
+          "",
+          "Распознано:",
+          "Название: " + title,
+          "Автор: " + author,
+          "ISBN: " + isbn,
+          "",
+          "Диагностика:",
+          ...search.diagnostics,
+          "",
+          "Не придумывай ссылку, рейтинг или отзывы."
+        ].join("\n")
+      });
+
+    }
+
+    const best = search.results[0];
+
+    const pages =
+      await getBookPages(best.url);
+
+    const alternatives =
+      search.results
+        .slice(1, 6)
+        .map(
+          x =>
+            "- score=" +
+            x.score +
+            " " +
+            x.label +
+            " — " +
+            x.url
+        );
 
     return JSON.stringify({
-      result:[
-        "Запрос: "+title+" — "+author,
-        "LitRes: "+best.url,
-        "Отзывы: "+reviews,
+      result: [
+        "РАСПОЗНАННАЯ КНИГА",
+        "Название: " + title,
+        "Автор: " + author,
+        "ISBN: " + isbn,
         "",
-        "Данные страницы книги:",
-        book.slice(0,6500),
+        "ЛУЧШЕЕ СОВПАДЕНИЕ LITRES",
+        "score: " + best.score,
+        "Название результата: " +
+          best.label,
+        "Книга: " +
+          pages.bookUrl,
+        "Отзывы: " +
+          pages.reviewsUrl,
         "",
-        "Данные страницы отзывов:",
-        rev.slice(0,7500),
+        "СТРАНИЦА КНИГИ",
+        pages.bookText.slice(
+          0,
+          MAX_TEXT
+        ),
         "",
-        "Используй только приведенные данные; ничего не выдумывай."
+        "СТРАНИЦА ОТЗЫВОВ",
+        pages.reviewsText.slice(
+          0,
+          MAX_TEXT
+        ),
+        "",
+        "АЛЬТЕРНАТИВНЫЕ РЕЗУЛЬТАТЫ",
+        ...alternatives,
+        "",
+        "ДИАГНОСТИКА ПОИСКА",
+        ...search.diagnostics,
+        "",
+        "Используй только приведенные данные. " +
+        "Не придумывай рейтинг, количество оценок " +
+        "или содержание отзывов."
       ].join("\n")
     });
 
-  }catch(e){
+  } catch (e) {
+
     return JSON.stringify({
-      error:"Ошибка поиска LitRes: "+e.message
+      error:
+        "book-litres error: " +
+        (e && e.message
+          ? e.message
+          : String(e))
     });
+
   }
 };
+
 </script>
+</body>
+</html>
