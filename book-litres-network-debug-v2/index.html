@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Network diagnostic</title></head><body>
+<script>
+async function main(data) {
+  var input = {};
+  try { input = typeof data === 'string' ? JSON.parse(data) : (data || {}); } catch (e) {}
+  var lines = ['DEBUG=NETWORK_V2', 'TITLE=' + (input.title || ''), 'AUTHOR=' + (input.author || ''), 'ISBN=' + (input.isbn || '')];
+  var tests = [
+    ['T1', 'https://example.com/'],
+    ['T2', 'https://www.google.com/'],
+    ['T3', 'https://www.bing.com/search?q=Kubernetes'],
+    ['T4', 'https://www.litres.ru/'],
+    ['T5', 'https://www.litres.ru/search/?q=Kubernetes'],
+    ['T6', 'https://r.jina.ai/https://www.litres.ru/'],
+    ['T7', 'https://r.jina.ai/https://www.bing.com/search?q=Kubernetes']
+  ];
+  for (var i = 0; i < tests.length; i++) {
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, 8000);
+    var started = Date.now();
+    try {
+      var response = await fetch(tests[i][1], {signal: controller.signal, cache: 'no-store'});
+      var text = await response.text();
+      lines.push(tests[i][0] + ' HTTP=' + response.status + ' MS=' + (Date.now()-started) + ' BYTES=' + text.length + ' TYPE=' + (response.headers.get('content-type') || 'unknown'));
+    } catch (e) {
+      lines.push(tests[i][0] + ' ERROR=' + (e && e.name || 'Error') + ': ' + (e && e.message || String(e)));
+    } finally { clearTimeout(timer); }
+  }
+  lines.push('END=NETWORK_V2');
+  return lines.join('\n');
+}
+</script>
+</body></html>
