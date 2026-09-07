@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Book LitRes Network Debug v3</title>
+</head>
+<body>
+<script>
+"use strict";
+
+const TIMEOUT_MS = 12000;
+
+async function testFetch(label, url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const started = Date.now();
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      cache: "no-store",
+      headers: {
+        "Accept": "text/plain, text/html;q=0.9, */*;q=0.1"
+      }
+    });
+
+    let text = "";
+    try {
+      text = await response.text();
+    } catch (_) {}
+
+    return [
+      `${label}=OK`,
+      `${label}_STATUS=${response.status}`,
+      `${label}_MS=${Date.now() - started}`,
+      `${label}_LEN=${text.length}`,
+      `${label}_TYPE=${response.headers.get("content-type") || "unknown"}`
+    ].join("\n");
+  } catch (e) {
+    return [
+      `${label}=ERR`,
+      `${label}_ERROR=${e && e.name ? e.name : "Error"}:${e && e.message ? e.message : String(e)}`
+    ].join("\n");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+window["ai_edge_gallery_get_result"] = async (data) => {
+  try {
+    const input = JSON.parse(data);
+
+    const tests = [
+      ["T1_EXAMPLE", "https://example.com/"],
+      ["T2_JINA_ROOT", "https://r.jina.ai/"],
+      ["T3_JINA_EXAMPLE", "https://r.jina.ai/https://example.com/"],
+      ["T4_BING", "https://www.bing.com/"],
+      ["T5_JINA_BING", "https://r.jina.ai/https://www.bing.com/"],
+      ["T6_LITRES", "https://www.litres.ru/"],
+      ["T7_JINA_LITRES", "https://r.jina.ai/https://www.litres.ru/"]
+    ];
+
+    const out = [
+      "DEBUG=NETWORK_V3",
+      `TITLE=${input.title || ""}`,
+      `AUTHOR=${input.author || ""}`,
+      `ISBN=${input.isbn || ""}`
+    ];
+
+    for (const [label, url] of tests) {
+      out.push(`URL_${label}=${url}`);
+      out.push(await testFetch(label, url));
+    }
+
+    out.push("END=NETWORK_V3");
+    return out.join("\n");
+  } catch (e) {
+    return `DEBUG=NETWORK_V3\nFATAL=${e && e.message ? e.message : String(e)}\nEND=NETWORK_V3`;
+  }
+};
+</script>
+</body>
+</html>
