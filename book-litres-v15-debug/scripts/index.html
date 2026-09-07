@@ -1,0 +1,14 @@
+<!doctype html><html><head><meta charset="utf-8"><title>LitRes v15 debug</title></head><body><script>
+"use strict";
+const PROXY = "https://litres-proxy-worker.adovzhenko.workers.dev";
+function p(data){ if(data&&typeof data==='object') return data; try{return JSON.parse(String(data||'{}'));}catch{return {};}}
+async function get(url,ms){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);try{const r=await fetch(url,{signal:c.signal,cache:'no-store'});const tx=await r.text();let body;try{body=JSON.parse(tx);}catch{body=tx.slice(0,1500);}return {http:r.status,body};}catch(e){return {http:0,error:(e&&e.name?e.name:'Error')+': '+(e&&e.message?e.message:String(e))};}finally{clearTimeout(t);}}
+window["ai_edge_gallery_get_result"] = async (data) => {
+ const i=p(data); const title=String(i.title||'').trim(); const author=String(i.author||'').trim(); const isbn=i.isbn==null?'':String(i.isbn).trim();
+ const ping=await get(PROXY+'/ping',8000);
+ const u=new URL(PROXY+'/'); u.searchParams.set('mode','book'); if(title)u.searchParams.set('title',title); if(author)u.searchParams.set('author',author); if(isbn)u.searchParams.set('isbn',isbn);
+ const book=await get(u.toString(),18000);
+ const out='PING='+JSON.stringify(ping)+'\nBOOK='+JSON.stringify(book);
+ return JSON.stringify({result:out});
+};
+</script></body></html>
