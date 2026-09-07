@@ -1,220 +1,249 @@
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+  "Cache-Control": "no-store"
+};
+
 export default {
   async fetch(request) {
-    const url = new URL(request.url);
-    const cors = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-      "Cache-Control": "no-store"
-    };
-
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
-    if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers: cors });
-
-    const mode = url.searchParams.get("mode") || "search";
-
+    const u = new URL(request.url);
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+    if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
+    const mode = u.searchParams.get("mode") || "search";
     try {
-      if (url.pathname === "/ping" || mode === "ping") {
-        return json({ ok: true, pong: true, version: 11, now: new Date().toISOString() }, 200, cors);
-      }
-
+      if (u.pathname === "/ping" || mode === "ping") return json({ ok: true, pong: true, version: "11.1" });
       if (mode === "fetch-test") {
-        const started = Date.now();
-        const r = await fetch("https://example.com/", { redirect: "follow" });
-        const text = await r.text();
-        return json({ ok: r.ok, status: r.status, elapsed_ms: Date.now() - started, length: text.length }, 200, cors);
+        const r = await fetchText("https://example.com/");
+        return json({ ok: r.ok, status: r.status, elapsed_ms: r.ms, length: r.text.length });
       }
-
-      // v11: do all heavy LitRes work here and return a small JSON object to AI Edge Gallery.
-      if (mode === "book") {
-        const title = clean(url.searchParams.get("title") || "");
-        const author = clean(url.searchParams.get("author") || "");
-        const isbn = clean(url.searchParams.get("isbn") || "");
-        if (!title && !isbn) return json({ ok: false, error: "missing title/isbn" }, 400, cors);
-
-        const queries = unique([
-          isbn,
-          [title, author].filter(Boolean).join(" "),
-          title
-        ].filter(Boolean));
-
-        let searchInfo = null;
-        let bookUrl = null;
-        for (const q of queries) {
-          const s = await fetchText("https://www.litres.ru/search/?q=" + encodeURIComponent(q));
-          searchInfo = { query: q, status: s.status, ms: s.ms, length: s.text.length };
-          if (!s.ok) continue;
-          bookUrl = chooseBookUrl(s.text, title, author);
-          if (bookUrl) break;
-        }
-
-        if (!bookUrl) {
-          return json({ ok: false, found: false, error: "book_not_found", search: searchInfo }, 200, cors);
-        }
-
-        const p = await fetchText(bookUrl);
-        if (!p.ok) {
-          return json({ ok: false, found: true, error: "book_page_fetch_failed", url: bookUrl, upstream_status: p.status, upstream_ms: p.ms }, 200, cors);
-        }
-
-        const parsed = parseBookPage(p.text, bookUrl);
-        parsed.ok = true;
-        parsed.found = true;
-        parsed.search = searchInfo;
-        parsed.upstream_ms = p.ms;
-        return json(parsed, 200, cors);
-      }
-
-      // Legacy raw search/page modes kept for diagnostics.
+      if (mode === "book") return json(await lookupBook(u));
       if (mode === "search") {
-        const q = clean(url.searchParams.get("q") || "");
-        if (!q) return json({ error: "missing q" }, 400, cors);
+        const q = clean(u.searchParams.get("q"));
+        if (!q) return json({ error: "missing_q" }, 400);
         const r = await fetchText("https://www.litres.ru/search/?q=" + encodeURIComponent(q));
-        return html(r.text, r.status, cors, r.ms);
+        return rawHtml(r);
       }
-
       if (mode === "page") {
-        const raw = url.searchParams.get("url") || "";
-        let target;
-        try { target = new URL(raw); } catch { return json({ error: "bad url" }, 400, cors); }
-        if (!/(^|\.)litres\.ru$/i.test(target.hostname)) return json({ error: "host not allowed" }, 403, cors);
-        const r = await fetchText(target.toString());
-        return html(r.text, r.status, cors, r.ms);
+        const target = safeLitresUrl(u.searchParams.get("url"));
+        if (!target) return json({ error: "host_not_allowed" }, 403);
+        return rawHtml(await fetchText(target));
       }
-
-      return json({ error: "unknown mode" }, 400, cors);
+      return json({ error: "unknown_mode" }, 400);
     } catch (e) {
-      return json({ ok: false, error: String(e && e.message ? e.message : e) }, 500, cors);
+      return json({ ok: false, error: "proxy_error", detail: String(e && e.message || e) }, 500);
     }
   }
 };
 
+async function lookupBook(u) {
+  const input = {
+    title: clean(u.searchParams.get("title")),
+    author: clean(u.searchParams.get("author")),
+    isbn: clean(u.searchParams.get("isbn"))
+  };
+  if (!input.title && !input.isbn) return { ok: false, found: false, error: "missing_title_and_isbn" };
+  const queries = [...new Set([input.isbn, [input.title, input.author].filter(Boolean).join(" "), input.title].filter(Boolean))];
+  const candidates = new Set();
+  let search = null;
+  for (const q of queries) {
+    const r = await fetchText("https://www.litres.ru/search/?q=" + encodeURIComponent(q));
+    search = { query: q, status: r.status, ms: r.ms };
+    if (!r.ok) continue;
+    for (const url of bookLinks(r.text).slice(0, 8)) candidates.add(url);
+    if (candidates.size) break;
+  }
+  let book = null;
+  for (const url of [...candidates].slice(0, 8)) {
+    const r = await fetchText(url);
+    if (!r.ok) continue;
+    const parsed = parseBookPage(r.text, r.url);
+    if (matchesBook(parsed, input)) { book = parsed; break; }
+  }
+  if (!book) return { ok: false, found: false, error: "no_verified_match", search };
+
+  // Follow the actual reviews link when one is present. Never guess a review URL.
+  if (book.review_page_url && (book.reviews_count == null || book.reviews_count > book.reviews.length)) {
+    try {
+      const r = await fetchText(book.review_page_url);
+      if (r.ok) {
+        const extra = parseBookPage(r.text, book.url);
+        book.reviews = mergeReviews(book.reviews, extra.reviews);
+        if (extra.reviews_count != null) book.reviews_count = extra.reviews_count;
+        book.reviews_source = book.review_page_url;
+      }
+    } catch (_) { /* Keep the verified book data when reviews cannot be fetched. */ }
+  }
+  book.reviews = mergeReviews(book.reviews, []);
+  const allDated = book.reviews.length > 0 && book.reviews.every(r => validDate(r.date));
+  const complete = book.reviews_count != null && book.reviews.length >= book.reviews_count;
+  book.reviews_order = allDated && complete ? "newest" : "unverified";
+  if (allDated) book.reviews.sort((a, b) => Date.parse(b.date) - Date.parse(a.date));
+  book.reviews = book.reviews.slice(0, 3).map(r => ({ ...r, text: r.text.slice(0, 1800) }));
+  book.ok = true;
+  book.found = true;
+  book.search = search;
+  return book;
+}
+
 async function fetchText(target) {
   const started = Date.now();
   const r = await fetch(target, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; LitResBookHelper/11.0)",
-      "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-      "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.5"
-    },
+    headers: { "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8", "Accept-Language": "ru-RU,ru;q=0.9" },
     redirect: "follow"
   });
   return { ok: r.ok, status: r.status, ms: Date.now() - started, text: await r.text(), url: r.url };
 }
 
-function chooseBookUrl(htmlText, title, author) {
-  const decoded = decodeHtml(htmlText.replace(/\\u002F/g, "/"));
-  const re = /(?:https?:\/\/www\.litres\.ru)?(\/book\/[^"'<>?\\\s]+\/?)/gi;
-  const seen = new Set();
-  const candidates = [];
-  let m;
-  while ((m = re.exec(decoded)) && candidates.length < 80) {
-    let path = m[1].replace(/\\\//g, "/");
-    if (!path.startsWith("/book/")) continue;
-    const full = "https://www.litres.ru" + path;
-    if (seen.has(full)) continue;
-    seen.add(full);
-    const slug = normalize(path);
-    let score = 0;
-    for (const w of words(title)) if (w.length >= 4 && slug.includes(w)) score += 3;
-    for (const w of words(author)) if (w.length >= 4 && slug.includes(w)) score += 2;
-    candidates.push({ url: full, score });
+function parseBookPage(html, url) {
+  const out = { url: safeLitresUrl(url), title: null, author: null, isbn: null, annotation: null, rating: null, ratings_count: null, reviews_count: null, reviews: [], reviews_order: "unverified", review_page_url: null };
+  const ld = [...html.matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+  for (const m of ld) {
+    try { readStructured(JSON.parse(m[1]), out, true); } catch (_) {}
   }
-  candidates.sort((a, b) => b.score - a.score);
-  return candidates.length ? candidates[0].url : null;
+  const embedded = [...html.matchAll(/<script\b[^>]*(?:id=["']__NEXT_DATA__["']|type=["']application\/json["'])[^>]*>([\s\S]*?)<\/script>/gi)];
+  for (const m of embedded) {
+    try { readStructured(JSON.parse(m[1]), out, false); } catch (_) {}
+  }
+  const plain = clean(stripTags(html));
+  if (!out.title) out.title = extract(plain, [/Основной контент книги\s+(.{3,220}?)\s+(?:Текст|PDF|Аудио|Объем)/i]);
+  if (!out.isbn) out.isbn = extract(plain, [/ISBN:\s*([0-9Xx\-]{10,20})/i]);
+  if (!out.annotation) {
+    const block = extract(html, [/<(?:h2|h3)[^>]*>\s*О книге\s*<\/[^>]+>([\s\S]*?)(?=<(?:h2|h3)\b|Жанры и теги|<\/section>)/i]);
+    if (block) out.annotation = clean(stripTags(block)).slice(0, 4500);
+  }
+  if (!out.annotation) {
+    const meta = extract(html, [/<meta\b(?=[^>]*\bname=["']description["'])[^>]*\bcontent=["']([^"']+)["']/i]);
+    if (meta && !/купить|скачать|читайте онлайн|интернет-магазин/i.test(meta)) out.annotation = clean(decodeHtml(meta));
+  }
+  if (out.rating == null) out.rating = ratingNumber(extract(plain, [/(?:Средний рейтинг|Рейтинг)\s*([0-5](?:[.,]\d+)?)/i]));
+  if (out.ratings_count == null) out.ratings_count = countNumber(extract(plain, [/(\d[\d\s]*)\s+оцен(?:ка|ки|ок)\b/i]));
+  if (out.reviews_count == null) out.reviews_count = countNumber(extract(plain, [/(?:Отзывы,?\s*)?(\d[\d\s]*)\s+отзыв(?:а|ов)?\b/i]));
+  out.review_page_url = findReviewsLink(html, out.url);
+  out.reviews = mergeReviews(out.reviews, []);
+  return out;
 }
 
-function parseBookPage(text, url) {
-  const result = { url, title: null, author: null, isbn: null, rating: null, ratings_count: null, reviews_count: null, reviews: [] };
-
-  // JSON-LD is the cleanest source when present.
-  const ldRe = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-  let m;
-  while ((m = ldRe.exec(text))) {
-    try {
-      const data = JSON.parse(decodeHtml(m[1]).trim());
-      walkJson(data, result);
-    } catch (_) {}
-  }
-
-  // Also inspect Next/embedded JSON because LitRes may keep review data there.
-  const nextRe = /<script[^>]+(?:id=["']__NEXT_DATA__["']|type=["']application\/json["'])[^>]*>([\s\S]*?)<\/script>/gi;
-  while ((m = nextRe.exec(text))) {
-    try { walkJson(JSON.parse(decodeHtml(m[1]).trim()), result); } catch (_) {}
-  }
-
-  const plain = clean(stripTags(text));
-  if (!result.title) result.title = firstMatch(plain, [/Основной контент книги\s+(.{3,180}?)\s+(?:автор|PDF|EPUB)/i]);
-  if (!result.isbn) result.isbn = firstMatch(plain, [/ISBN[:\s]+([0-9Xx\-]{10,20})/i]);
-  if (result.rating == null) {
-    const x = firstMatch(plain, [/(?:Средний рейтинг|Рейтинг)\s*([0-5](?:[.,]\d+)?)/i]);
-    if (x) result.rating = Number(x.replace(",", "."));
-  }
-  if (result.reviews_count == null) {
-    const x = firstMatch(plain, [/(\d+)\s+отзыв(?:а|ов)?/i]);
-    if (x) result.reviews_count = Number(x);
-  }
-
-  // Deduplicate and keep the response small enough for the on-device model.
-  const seen = new Set();
-  result.reviews = result.reviews.filter(r => {
-    const key = clean(r.text || "").slice(0, 180).toLowerCase();
-    if (!key || key.length < 20 || seen.has(key)) return false;
-    seen.add(key);
-    r.text = clean(r.text).slice(0, 1800);
-    return true;
-  }).slice(0, 8);
-
-  return result;
-}
-
-function walkJson(node, out) {
-  if (!node) return;
-  if (Array.isArray(node)) { for (const x of node) walkJson(x, out); return; }
-  if (typeof node !== "object") return;
-
-  const type = String(node["@type"] || node.type || "").toLowerCase();
-  if (/book|product/.test(type)) {
-    if (!out.title && typeof node.name === "string") out.title = clean(node.name);
-    if (!out.isbn && node.isbn) out.isbn = clean(String(node.isbn));
-    const a = node.author;
-    if (!out.author && a) out.author = clean(typeof a === "string" ? a : (Array.isArray(a) ? a.map(x => x && (x.name || x)).join(", ") : (a.name || "")));
-  }
-
-  const ar = node.aggregateRating || node.rating;
-  if (ar && typeof ar === "object") {
-    if (out.rating == null && ar.ratingValue != null) out.rating = numberOrNull(ar.ratingValue);
-    if (out.ratings_count == null && ar.ratingCount != null) out.ratings_count = numberOrNull(ar.ratingCount);
-    if (out.reviews_count == null && ar.reviewCount != null) out.reviews_count = numberOrNull(ar.reviewCount);
-  }
-
-  if (/review|comment/.test(type) || (node.reviewBody && (node.author || node.datePublished))) {
-    const body = node.reviewBody || node.text || node.content || node.comment;
-    if (typeof body === "string" && body.length >= 20) {
-      const author = node.author && (typeof node.author === "string" ? node.author : node.author.name);
-      const rr = node.reviewRating && (node.reviewRating.ratingValue || node.reviewRating.value);
-      out.reviews.push({ author: clean(author || ""), date: clean(node.datePublished || node.date || ""), rating: numberOrNull(rr), text: clean(body) });
+function readStructured(root, out, schema) {
+  const seen = new WeakSet();
+  let visited = 0;
+  function walk(n, depth, context) {
+    if (!n || typeof n !== "object" || depth > 35 || ++visited > 30000 || seen.has(n)) return;
+    seen.add(n);
+    if (Array.isArray(n)) { for (const x of n) walk(x, depth + 1, context); return; }
+    const type = String(n["@type"] || n.type || "").toLowerCase();
+    const book = /^(book|product|ebook|audiobook)$/.test(type) || (!schema && (n.bookId || n.book_id || n.artId || n.art_id));
+    if (book) {
+      if (!out.title) out.title = clean(n.name || n.title);
+      if (!out.author) out.author = personName(n.author || n.authors);
+      if (!out.isbn) out.isbn = clean(n.isbn);
+      if (!out.annotation) out.annotation = description(n.annotation || n.description || n.annotation_html || n.annotationHtml);
+      const a = n.aggregateRating || n.rating;
+      if (a && typeof a === "object") readRating(a, out);
+    }
+    if (schema && n.aggregateRating && typeof n.aggregateRating === "object") readRating(n.aggregateRating, out);
+    const reviewContext = /review|recense/.test(type) || context === "reviews" || n.review_html != null || n.reviewBody != null || n.reviewText != null || n.review_text != null;
+    if (reviewContext && !/rating/.test(type)) {
+      const body = n.reviewBody || n.review_html || n.reviewHtml || n.reviewText || n.review_text || n.commentText || n.comment_text || n.text || n.content;
+      if (typeof body === "string" && clean(stripTags(body)).length >= 20) {
+        const rating = n.reviewRating && typeof n.reviewRating === "object" ? n.reviewRating.ratingValue : (n.user_mark ?? n.userMark ?? n.mark ?? null);
+        out.reviews.push({
+          author: personName(n.nickname || n.userName || n.username || n.authorName || n.author),
+          date: dateValue(n.datePublished || n.added || n.createdAt || n.created_at || n.date),
+          rating: ratingNumber(rating),
+          text: clean(stripTags(body)).slice(0, 4000)
+        });
+      }
+    }
+    if (!schema && book && !out.annotation) out.annotation = description(n.shortDescription || n.short_description);
+    if (schema && book && Array.isArray(n.review)) for (const r of n.review) walk(r, depth + 1, "reviews");
+    for (const [k, v] of Object.entries(n)) {
+      if (v && typeof v === "object") walk(v, depth + 1, /^(reviews|review|comments|recenses)$/.test(k) ? "reviews" : null);
     }
   }
-
-  // Common non-JSON-LD field names used by application state.
-  if (!out.title && typeof node.title === "string" && node.title.length < 250 && (node.book || node.bookId || node.book_id)) out.title = clean(node.title);
-  if (out.rating == null && node.rating != null && typeof node.rating !== "object") {
-    const n = numberOrNull(node.rating); if (n != null && n >= 0 && n <= 5) out.rating = n;
-  }
-  const body = node.reviewText || node.review_text || node.commentText || node.comment_text;
-  if (typeof body === "string" && body.length >= 20) out.reviews.push({ author: clean(node.userName || node.username || node.authorName || ""), date: clean(node.date || node.createdAt || ""), rating: numberOrNull(node.rating), text: clean(body) });
-
-  for (const v of Object.values(node)) if (v && typeof v === "object") walkJson(v, out);
+  walk(root, 0, null);
 }
 
-function words(s) { return normalize(s).split(/[^a-zа-яё0-9]+/i).filter(Boolean); }
-function normalize(s) { return clean(String(s || "")).toLowerCase().replace(/ё/g, "е"); }
-function clean(s) { return String(s == null ? "" : s).replace(/\s+/g, " ").trim(); }
-function stripTags(s) { return decodeHtml(String(s).replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ")); }
-function decodeHtml(s) { return String(s).replace(/&quot;/g, '"').replace(/&#34;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " "); }
-function firstMatch(s, arr) { for (const r of arr) { const m = r.exec(s); if (m) return clean(m[1]); } return null; }
-function numberOrNull(v) { const n = Number(String(v == null ? "" : v).replace(",", ".")); return Number.isFinite(n) ? n : null; }
-function unique(a) { return [...new Set(a)]; }
-function json(obj, status, headers) { return new Response(JSON.stringify(obj), { status, headers: { ...headers, "Content-Type": "application/json; charset=utf-8" } }); }
-function html(text, status, headers, ms) { return new Response(text, { status, headers: { ...headers, "Content-Type": "text/html; charset=utf-8", "X-Proxy-Upstream-Ms": String(ms), "X-Proxy-Upstream-Length": String(text.length) } }); }
+function readRating(a, out) {
+  if (out.rating == null) out.rating = ratingNumber(a.ratingValue ?? a.value);
+  if (out.ratings_count == null) out.ratings_count = countNumber(a.ratingCount ?? a.rating_count);
+  if (out.reviews_count == null) out.reviews_count = countNumber(a.reviewCount ?? a.review_count);
+}
+
+function mergeReviews(a, b) {
+  const map = new Map();
+  for (const r of [...a, ...b]) {
+    if (!r || !r.text) continue;
+    const key = clean(r.text).toLowerCase();
+    if (!map.has(key)) map.set(key, r);
+    else {
+      const old = map.get(key);
+      if (!old.date && r.date) old.date = r.date;
+      if (!old.author && r.author) old.author = r.author;
+      if (old.rating == null && r.rating != null) old.rating = r.rating;
+    }
+  }
+  return [...map.values()];
+}
+
+function bookLinks(html) {
+  const s = decodeHtml(html).replace(/\\u002F/gi, "/").replace(/\\\//g, "/");
+  const result = new Set();
+  const re = /(?:https?:\/\/www\.litres\.ru)?(\/book\/[^"'<>?\s\\]+\/?)/gi;
+  let m;
+  while ((m = re.exec(s)) && result.size < 80) {
+    const u = safeLitresUrl("https://www.litres.ru" + m[1]);
+    if (u) result.add(u);
+  }
+  return [...result];
+}
+
+function matchesBook(book, input) {
+  if (input.isbn && book.isbn && digits(input.isbn) === digits(book.isbn)) return true;
+  if (!input.title || !book.title) return false;
+  const a = words(input.title), b = words(book.title);
+  if (!a.length || !b.length) return false;
+  const overlap = a.filter(w => b.includes(w)).length / Math.max(a.length, b.length);
+  if (overlap < 0.72) return false;
+  if (input.author && book.author) {
+    const x = words(input.author), y = words(book.author);
+    if (x.length && !x.some(w => y.includes(w))) return false;
+  }
+  return true;
+}
+
+function findReviewsLink(html, bookUrl) {
+  const re = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(html))) {
+    if (!/Смотреть все отзывы|Все отзывы/i.test(stripTags(m[2]))) continue;
+    const href = extract(m[1], [/\bhref=["']([^"']+)["']/i]);
+    if (!href) continue;
+    const target = safeLitresUrl(href, bookUrl);
+    if (target && new URL(target).pathname.startsWith(new URL(bookUrl).pathname)) return target;
+  }
+  return null;
+}
+
+function safeLitresUrl(value, base) {
+  try {
+    const u = new URL(value, base || "https://www.litres.ru/");
+    if (u.protocol !== "https:" || !/(^|\.)litres\.ru$/i.test(u.hostname)) return null;
+    u.hash = "";
+    return u.toString();
+  } catch (_) { return null; }
+}
+function personName(v) { if (typeof v === "string") return clean(v); if (Array.isArray(v)) return v.map(personName).filter(Boolean).join(", "); return v && typeof v === "object" ? clean(v.name || v.fullName || v.nickname) : ""; }
+function description(v) { if (typeof v === "string") return clean(stripTags(v)).slice(0, 4500) || null; if (v && typeof v === "object") return description(v.text || v.html || v.value || v.content); return null; }
+function dateValue(v) { if (typeof v !== "string") return null; return validDate(v) ? v : null; }
+function validDate(v) { return typeof v === "string" && /^\d{4}-\d\d-\d\d/.test(v) && Number.isFinite(Date.parse(v)); }
+function ratingNumber(v) { if (v == null || v === "") return null; const n = Number(String(v).replace(",", ".")); return Number.isFinite(n) && n >= 0 && n <= 5 ? n : null; }
+function countNumber(v) { if (v == null || v === "") return null; const n = Number(String(v).replace(/\s/g, "")); return Number.isSafeInteger(n) && n >= 0 ? n : null; }
+function words(v) { return clean(v).toLowerCase().replace(/ё/g, "е").split(/[^a-zа-я0-9]+/i).filter(w => w.length > 2); }
+function digits(v) { return String(v).replace(/[^0-9X]/gi, ""); }
+function clean(v) { return String(v == null ? "" : v).replace(/\s+/g, " ").trim(); }
+function decodeHtml(s) { return String(s).replace(/&quot;|&#34;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;|&#160;/g, " ").replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n))); }
+function stripTags(s) { return decodeHtml(String(s).replace(/<script\b[\s\S]*?<\/script>/gi, " ").replace(/<style\b[\s\S]*?<\/style>/gi, " ").replace(/<br\s*\/?\s*>/gi, "\n").replace(/<\/p>/gi, "\n").replace(/<[^>]+>/g, " ")); }
+function extract(s, patterns) { for (const p of patterns) { const m = p.exec(s); if (m) return m[1]; } return null; }
+function json(obj, status = 200) { return new Response(JSON.stringify(obj), { status, headers: { ...CORS, "Content-Type": "application/json; charset=utf-8" } }); }
+function rawHtml(r) { return new Response(r.text, { status: r.status, headers: { ...CORS, "Content-Type": "text/html; charset=utf-8", "X-Proxy-Upstream-Ms": String(r.ms), "X-Proxy-Upstream-Length": String(r.text.length) } }); }
