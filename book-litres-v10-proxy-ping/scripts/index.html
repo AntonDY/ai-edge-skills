@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>LitRes proxy ping v10</title></head><body><script>
+"use strict";
+const PROXY = "https://litres-proxy-worker.adovzhenko.workers.dev";
+
+async function timedFetch(url, timeoutMs) {
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), timeoutMs);
+  const started = Date.now();
+  try {
+    const r = await fetch(url, { signal: c.signal, cache: "no-store" });
+    const text = await r.text();
+    return {
+      ok: true,
+      status: r.status,
+      ms: Date.now() - started,
+      len: text.length,
+      acao: r.headers.get("access-control-allow-origin") || "NONE",
+      body: text.slice(0, 300).replace(/\s+/g, " ")
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      name: e && e.name ? e.name : "Error",
+      msg: e && e.message ? e.message : String(e),
+      ms: Date.now() - started
+    };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+window["ai_edge_gallery_get_result"] = async (data) => {
+  const ping = await timedFetch(PROXY + "/ping", 8000);
+  const fetchTest = await timedFetch(PROXY + "/?mode=fetch-test", 12000);
+
+  const lines = ["PROXY_V10"];
+  if (ping.ok) {
+    lines.push(`PING=OK HTTP=${ping.status} MS=${ping.ms} ACAO=${ping.acao} LEN=${ping.len} BODY=${ping.body}`);
+  } else {
+    lines.push(`PING=ERR NAME=${ping.name} MSG=${ping.msg} MS=${ping.ms}`);
+  }
+
+  if (fetchTest.ok) {
+    lines.push(`FETCHTEST=OK HTTP=${fetchTest.status} MS=${fetchTest.ms} ACAO=${fetchTest.acao} LEN=${fetchTest.len} BODY=${fetchTest.body}`);
+  } else {
+    lines.push(`FETCHTEST=ERR NAME=${fetchTest.name} MSG=${fetchTest.msg} MS=${fetchTest.ms}`);
+  }
+
+  return JSON.stringify({ result: lines.join("\n") });
+};
+</script></body></html>
