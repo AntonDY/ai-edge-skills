@@ -2,7 +2,7 @@
 <html lang="en"><head><meta charset="utf-8"><title>Book LitRes v7 proxy</title></head><body><script>
 "use strict";
 
-const PROXY_BASE = "https://REPLACE-WITH-YOUR-WORKER.workers.dev";
+const PROXY_BASE = "https://litres-proxy-worker.adovzhenko.workers.dev";
 const TIMEOUT_MS = 15000;
 
 function clean(s) { return String(s || "").replace(/\s+/g, " ").trim(); }
@@ -55,10 +55,6 @@ function stripHtml(s) {
 
 window["ai_edge_gallery_get_result"] = async (data) => {
   try {
-    if (PROXY_BASE.includes("REPLACE-WITH-YOUR-WORKER")) {
-      return JSON.stringify({ error: "PROXY_BASE is not configured yet." });
-    }
-
     const x = JSON.parse(data || "{}");
     const title = clean(x.title);
     const author = clean(x.author);
