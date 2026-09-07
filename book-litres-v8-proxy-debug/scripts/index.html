@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Book LitRes v8 proxy debug</title></head><body><script>
+"use strict";
+
+const PROXY_BASE = "https://litres-proxy-worker.adovzhenko.workers.dev";
+const TIMEOUT_MS = 15000;
+
+window["ai_edge_gallery_get_result"] = async (data) => {
+  const lines = ["DEBUG=PROXY_V8", "PROXY=" + PROXY_BASE];
+  try {
+    const x = JSON.parse(data || "{}");
+    lines.push("TITLE=" + String(x.title || ""));
+    lines.push("AUTHOR=" + String(x.author || ""));
+
+    const q = [x.title || "", x.author || ""].filter(Boolean).join(" ") || "Kubernetes";
+    const url = PROXY_BASE + "/?mode=search&q=" + encodeURIComponent(q);
+    lines.push("URL=" + url);
+
+    const c = new AbortController();
+    const timer = setTimeout(() => c.abort(), TIMEOUT_MS);
+    try {
+      const r = await fetch(url, {
+        signal: c.signal,
+        cache: "no-store",
+        headers: { "Accept": "text/html,text/plain,*/*" }
+      });
+      const text = await r.text();
+      lines.push("FETCH=OK");
+      lines.push("HTTP_STATUS=" + r.status);
+      lines.push("HTTP_OK=" + (r.ok ? "YES" : "NO"));
+      lines.push("CONTENT_TYPE=" + (r.headers.get("content-type") || ""));
+      lines.push("ACAO=" + (r.headers.get("access-control-allow-origin") || ""));
+      lines.push("LEN=" + text.length);
+      lines.push("BODY_PREFIX=" + text.slice(0, 1200).replace(/\s+/g, " "));
+    } catch (e) {
+      lines.push("FETCH=ERROR");
+      lines.push("ERROR_NAME=" + (e && e.name ? e.name : "Error"));
+      lines.push("ERROR_MESSAGE=" + (e && e.message ? e.message : String(e)));
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (e) {
+    lines.push("FATAL=" + (e && e.message ? e.message : String(e)));
+  }
+  lines.push("END=PROXY_V8");
+  return JSON.stringify({ result: lines.join("\n") });
+};
+</script></body></html>
