@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><title>Book LitRes v12</title></head><body><script>
+"use strict";
+
+const PROXY = "https://litres-proxy-worker.adovzhenko.workers.dev";
+
+function parseInput(data) {
+  if (data == null) return {};
+  if (typeof data === "object") return data;
+  try { return JSON.parse(String(data)); } catch (_) { return {}; }
+}
+
+async function fetchJson(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
+    const text = await response.text();
+    try { return { ok: true, http: response.status, body: JSON.parse(text) }; }
+    catch (_) { return { ok: false, http: response.status, error: "Некорректный ответ прокси" }; }
+  } catch (e) {
+    return { ok: false, http: 0, error: e && e.name === "AbortError" ? "Истекло время ожидания ответа" : "Не удалось связаться с прокси" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function n(v) {
+  return v == null || v === "" ? null : String(v).replace(".", ",");
+}
+
+function cleanText(v, max) {
+  const s = String(v == null ? "" : v).replace(/\s+/g, " ").trim();
+  return max ? s.slice(0, max) : s;
+}
+
+function buildSourceCard(b) {
+  if (!b || b.ok !== true || b.found !== true) {
+    return "Не удалось получить проверенную карточку книги с ЛитРес. Причина: " + cleanText(b && (b.error || b.detail) || "неизвестная ошибка", 300) + ".";
+  }
+
+  const lines = [];
+  lines.push("ПРОВЕРЕННАЯ КАРТОЧКА ЛИТРЕС");
+  lines.push("Книга: " + cleanText(b.title || "не указано", 300));
+  lines.push("Автор: " + cleanText(b.author || "не указан", 200));
+  if (b.url) lines.push("Ссылка: " + cleanText(b.url, 700));
+  if (b.isbn) lines.push("ISBN: " + cleanText(b.isbn, 80));
+  if (b.annotation) lines.push("Аннотация: " + cleanText(b.annotation, 4500));
+
+  lines.push("Рейтинг: " + (n(b.rating) || "не указан") + " из 5");
+  lines.push("Количество пользовательских оценок: " + (b.ratings_count == null ? "не указано" : String(b.ratings_count)));
+  lines.push("Количество письменных отзывов: " + (b.reviews_count == null ? "не указано" : String(b.reviews_count)));
+
+  if (Array.isArray(b.reviews) && b.reviews.length) {
+    lines.push("Тексты отзывов:");
+    b.reviews.slice(0, 5).forEach((r, i) => {
+      const parts = [];
+      if (r.author) parts.push("читатель: " + cleanText(r.author, 120));
+      if (r.date) parts.push("дата: " + cleanText(r.date, 80));
+      if (r.rating != null) parts.push("личная оценка: " + n(r.rating) + " из 5");
+      lines.push((i + 1) + ". " + (parts.length ? parts.join("; ") + ". " : "") + cleanText(r.text, 2200));
+    });
+  } else if (b.reviews_text) {
+    lines.push("Тексты отзывов с видимой страницы ЛитРес:");
+    lines.push(cleanText(b.reviews_text, 12000));
+  } else {
+    lines.push("Тексты отзывов: не удалось извлечь.");
+  }
+
+  return lines.join("\n");
+}
+
+window["ai_edge_gallery_get_result"] = async (data) => {
+  const input = parseInput(data);
+  const title = String(input.title || "").trim();
+  const author = String(input.author || "").trim();
+  const isbn = input.isbn == null ? "" : String(input.isbn).trim();
+  const language = String(input.language || "ru").trim();
+
+  if (!title && !isbn) {
+    return JSON.stringify({ result: "Не удалось определить название книги или ISBN." });
+  }
+
+  const u = new URL(PROXY + "/");
+  u.searchParams.set("mode", "book");
+  if (title) u.searchParams.set("title", title);
+  if (author) u.searchParams.set("author", author);
+  if (isbn) u.searchParams.set("isbn", isbn);
+  if (language) u.searchParams.set("language", language);
+
+  const r = await fetchJson(u.toString(), 20000);
+  if (!r.ok) return JSON.stringify({ result: "Не удалось получить данные ЛитРес: " + r.error + "." });
+
+  return JSON.stringify({ result: buildSourceCard(r.body) });
+};
+</script></body></html>
