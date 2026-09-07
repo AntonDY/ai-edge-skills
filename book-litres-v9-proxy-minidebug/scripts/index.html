@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>LitRes proxy mini debug v9</title></head><body><script>
+"use strict";
+const PROXY = "https://litres-proxy-worker.adovzhenko.workers.dev";
+window["ai_edge_gallery_get_result"] = async (data) => {
+  try {
+    const x = JSON.parse(data || "{}");
+    const q = [x.title || "", x.author || ""].filter(Boolean).join(" ") || "Kubernetes";
+    const url = PROXY + "/?mode=search&q=" + encodeURIComponent(q);
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(), 12000);
+    try {
+      const r = await fetch(url, { signal: c.signal, cache: "no-store" });
+      const text = await r.text();
+      const acao = r.headers.get("access-control-allow-origin") || "NONE";
+      return JSON.stringify({result: `PROXY_V9_OK_HTTP_${r.status}_ACAO_${acao}_LEN_${text.length}`});
+    } catch (e) {
+      const name = e && e.name ? e.name : "Error";
+      const msg = e && e.message ? e.message : String(e);
+      return JSON.stringify({result: `PROXY_V9_ERR_${name}_${msg}`});
+    } finally {
+      clearTimeout(t);
+    }
+  } catch (e) {
+    return JSON.stringify({result: `PROXY_V9_FATAL_${e && e.message ? e.message : String(e)}`});
+  }
+};
+</script></body></html>
