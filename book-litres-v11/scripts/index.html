@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Book LitRes v11</title></head><body><script>
+"use strict";
+
+const PROXY = "https://litres-proxy-worker.adovzhenko.workers.dev";
+
+function parseInput(data) {
+  if (data == null) return {};
+  if (typeof data === "object") return data;
+  try { return JSON.parse(String(data)); } catch (_) { return {}; }
+}
+
+async function fetchJson(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const started = Date.now();
+  try {
+    const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
+    const text = await response.text();
+    let body;
+    try { body = JSON.parse(text); }
+    catch (_) { body = { ok: false, error: "proxy_returned_non_json", preview: text.slice(0, 300) }; }
+    return { transport_ok: true, http: response.status, ms: Date.now() - started, body };
+  } catch (e) {
+    return {
+      transport_ok: false,
+      http: 0,
+      ms: Date.now() - started,
+      body: { ok: false, error: e && e.name === "AbortError" ? "proxy_timeout" : "proxy_fetch_failed", detail: e && e.message ? e.message : String(e) }
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+window["ai_edge_gallery_get_result"] = async (data) => {
+  const input = parseInput(data);
+  const title = String(input.title || "").trim();
+  const author = String(input.author || "").trim();
+  const isbn = input.isbn == null ? "" : String(input.isbn).trim();
+  const language = String(input.language || "ru").trim();
+
+  if (!title && !isbn) {
+    return JSON.stringify({ result: JSON.stringify({ ok: false, found: false, error: "missing_title_and_isbn" }) });
+  }
+
+  const u = new URL(PROXY + "/");
+  u.searchParams.set("mode", "book");
+  if (title) u.searchParams.set("title", title);
+  if (author) u.searchParams.set("author", author);
+  if (isbn) u.searchParams.set("isbn", isbn);
+  if (language) u.searchParams.set("language", language);
+
+  const r = await fetchJson(u.toString(), 18000);
+  const output = r.body && typeof r.body === "object" ? r.body : { ok: false, error: "invalid_proxy_response" };
+  output.client_http = r.http;
+  output.client_ms = r.ms;
+  if (!r.transport_ok) output.transport_ok = false;
+
+  // AI Edge Gallery reliably accepts a string result; encode the structured payload inside it.
+  return JSON.stringify({ result: JSON.stringify(output) });
+};
+</script></body></html>
