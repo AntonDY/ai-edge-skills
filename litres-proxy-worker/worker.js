@@ -12,7 +12,7 @@ export default {
     if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
     const mode = u.searchParams.get("mode") || "search";
     try {
-      if (u.pathname === "/ping" || mode === "ping") return json({ ok: true, pong: true, version: "11.1" });
+      if (u.pathname === "/ping" || mode === "ping") return json({ ok: true, pong: true, version: "11.2" });
       if (mode === "fetch-test") {
         const r = await fetchText("https://example.com/");
         return json({ ok: r.ok, status: r.status, elapsed_ms: r.ms, length: r.text.length });
@@ -21,8 +21,7 @@ export default {
       if (mode === "search") {
         const q = clean(u.searchParams.get("q"));
         if (!q) return json({ error: "missing_q" }, 400);
-        const r = await fetchText("https://www.litres.ru/search/?q=" + encodeURIComponent(q));
-        return rawHtml(r);
+        return rawHtml(await fetchText("https://www.litres.ru/search/?q=" + encodeURIComponent(q)));
       }
       if (mode === "page") {
         const target = safeLitresUrl(u.searchParams.get("url"));
@@ -50,39 +49,44 @@ async function lookupBook(u) {
     const r = await fetchText("https://www.litres.ru/search/?q=" + encodeURIComponent(q));
     search = { query: q, status: r.status, ms: r.ms };
     if (!r.ok) continue;
-    for (const url of bookLinks(r.text).slice(0, 8)) candidates.add(url);
+    for (const link of bookLinks(r.text).slice(0, 8)) candidates.add(link);
     if (candidates.size) break;
   }
   let book = null;
-  for (const url of [...candidates].slice(0, 8)) {
-    const r = await fetchText(url);
+  for (const link of [...candidates].slice(0, 8)) {
+    const r = await fetchText(link);
     if (!r.ok) continue;
     const parsed = parseBookPage(r.text, r.url);
     if (matchesBook(parsed, input)) { book = parsed; break; }
   }
   if (!book) return { ok: false, found: false, error: "no_verified_match", search };
 
-  // Follow the actual reviews link when one is present. Never guess a review URL.
+  // Fetch the actual review destination only, never a guessed endpoint.
   if (book.review_page_url && (book.reviews_count == null || book.reviews_count > book.reviews.length)) {
     try {
       const r = await fetchText(book.review_page_url);
       if (r.ok) {
         const extra = parseBookPage(r.text, book.url);
         book.reviews = mergeReviews(book.reviews, extra.reviews);
-        if (extra.reviews_count != null) book.reviews_count = extra.reviews_count;
+        // Do not replace book-wide counts with a count from a review widget.
+        if (book.reviews_count == null && extra.reviews_count != null) book.reviews_count = extra.reviews_count;
         book.reviews_source = book.review_page_url;
       }
-    } catch (_) { /* Keep the verified book data when reviews cannot be fetched. */ }
+    } catch (_) { /* Preserve verified book data on a review-fetch failure. */ }
   }
   book.reviews = mergeReviews(book.reviews, []);
   const allDated = book.reviews.length > 0 && book.reviews.every(r => validDate(r.date));
   const complete = book.reviews_count != null && book.reviews.length >= book.reviews_count;
   book.reviews_order = allDated && complete ? "newest" : "unverified";
   if (allDated) book.reviews.sort((a, b) => Date.parse(b.date) - Date.parse(a.date));
-  book.reviews = book.reviews.slice(0, 3).map(r => ({ ...r, text: r.text.slice(0, 1800) }));
+  // All reviews when there are five or fewer; otherwise the five newest available.
+  book.reviews = book.reviews.slice(0, 5).map(r => ({ ...r, text: r.text.slice(0, 1800) }));
+  book.reviews_returned = book.reviews.length;
+  book.reviews_complete = complete;
   book.ok = true;
   book.found = true;
   book.search = search;
+  delete book._metricPriority;
   return book;
 }
 
@@ -96,7 +100,7 @@ async function fetchText(target) {
 }
 
 function parseBookPage(html, url) {
-  const out = { url: safeLitresUrl(url), title: null, author: null, isbn: null, annotation: null, rating: null, ratings_count: null, reviews_count: null, reviews: [], reviews_order: "unverified", review_page_url: null };
+  const out = { url: safeLitresUrl(url), title: null, author: null, isbn: null, annotation: null, rating: null, ratings_count: null, reviews_count: null, reviews: [], reviews_order: "unverified", review_page_url: null, _metricPriority: {} };
   const ld = [...html.matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
   for (const m of ld) {
     try { readStructured(JSON.parse(m[1]), out, true); } catch (_) {}
@@ -116,12 +120,33 @@ function parseBookPage(html, url) {
     const meta = extract(html, [/<meta\b(?=[^>]*\bname=["']description["'])[^>]*\bcontent=["']([^"']+)["']/i]);
     if (meta && !/купить|скачать|читайте онлайн|интернет-магазин/i.test(meta)) out.annotation = clean(decodeHtml(meta));
   }
-  if (out.rating == null) out.rating = ratingNumber(extract(plain, [/(?:Средний рейтинг|Рейтинг)\s*([0-5](?:[.,]\d+)?)/i]));
-  if (out.ratings_count == null) out.ratings_count = countNumber(extract(plain, [/(\d[\d\s]*)\s+оцен(?:ка|ки|ок)\b/i]));
-  if (out.reviews_count == null) out.reviews_count = countNumber(extract(plain, [/(?:Отзывы,?\s*)?(\d[\d\s]*)\s+отзыв(?:а|ов)?\b/i]));
+  // Prefer the visible book header. Ratings and written reviews are separate metrics.
+  const header = plain.slice(0, 14000);
+  const rating = ratingNumber(extract(header, [/(?:Средний рейтинг|Рейтинг)\s*([0-5](?:[.,]\d+)?)/i]));
+  setMetric(out, "rating", rating, 100);
+  const ratings = countNumber(extract(header, [/(\d[\d\s]*)\s+оцен(?:ка|ки|ок)\b/i, /(?:Оценок|Оценки)\s*[:—]?\s*(\d[\d\s]*)\b/i]));
+  setMetric(out, "ratings_count", ratings, 100);
+  const reviews = countNumber(extract(header, [/(\d[\d\s]*)\s+отзыв(?:а|ов)?\b/i, /Отзывы\s*[:—]?\s*(\d[\d\s]*)\b/i]));
+  setMetric(out, "reviews_count", reviews, 100);
   out.review_page_url = findReviewsLink(html, out.url);
   out.reviews = mergeReviews(out.reviews, []);
+  delete out._metricPriority;
   return out;
+}
+
+function setMetric(out, key, value, priority) {
+  if (value == null) return;
+  const old = out._metricPriority[key] || 0;
+  if (out[key] == null || priority > old || (priority === old && out[key] === 0 && value > 0)) {
+    out[key] = value;
+    out._metricPriority[key] = priority;
+  }
+}
+function readRating(a, out, priority) {
+  if (!a || typeof a !== "object") return;
+  setMetric(out, "rating", ratingNumber(a.ratingValue ?? a.value), priority);
+  setMetric(out, "ratings_count", countNumber(a.ratingCount ?? a.rating_count), priority);
+  setMetric(out, "reviews_count", countNumber(a.reviewCount ?? a.review_count), priority);
 }
 
 function readStructured(root, out, schema) {
@@ -139,35 +164,32 @@ function readStructured(root, out, schema) {
       if (!out.isbn) out.isbn = clean(n.isbn);
       if (!out.annotation) out.annotation = description(n.annotation || n.description || n.annotation_html || n.annotationHtml);
       const a = n.aggregateRating || n.rating;
-      if (a && typeof a === "object") readRating(a, out);
+      if (a && typeof a === "object") readRating(a, out, schema ? 80 : 40);
+      // Explicit book-level application fields; never treat review_count as rating_count.
+      if (!schema) {
+        setMetric(out, "ratings_count", countNumber(n.ratings_count ?? n.rating_count ?? n.ratingsCount ?? n.ratingCount ?? n.marks_count ?? n.marksCount), 45);
+        setMetric(out, "reviews_count", countNumber(n.reviews_count ?? n.review_count ?? n.reviewsCount ?? n.reviewCount), 45);
+      }
     }
-    if (schema && n.aggregateRating && typeof n.aggregateRating === "object") readRating(n.aggregateRating, out);
-    const reviewContext = /review|recense/.test(type) || context === "reviews" || n.review_html != null || n.reviewBody != null || n.reviewText != null || n.review_text != null;
+    const reviewContext = /^(review|userreview|bookreview|comment|recense)$/.test(type) || context === "reviews" || n.review_html != null || n.reviewBody != null || n.reviewText != null || n.review_text != null;
     if (reviewContext && !/rating/.test(type)) {
       const body = n.reviewBody || n.review_html || n.reviewHtml || n.reviewText || n.review_text || n.commentText || n.comment_text || n.text || n.content;
-      if (typeof body === "string" && clean(stripTags(body)).length >= 20) {
-        const rating = n.reviewRating && typeof n.reviewRating === "object" ? n.reviewRating.ratingValue : (n.user_mark ?? n.userMark ?? n.mark ?? null);
+      const text = typeof body === "string" ? clean(stripTags(body)) : "";
+      if (text.length >= 20) {
+        const rr = n.reviewRating && typeof n.reviewRating === "object" ? n.reviewRating.ratingValue : (n.user_mark ?? n.userMark ?? n.mark ?? null);
         out.reviews.push({
           author: personName(n.nickname || n.userName || n.username || n.authorName || n.author),
           date: dateValue(n.datePublished || n.added || n.createdAt || n.created_at || n.date),
-          rating: ratingNumber(rating),
-          text: clean(stripTags(body)).slice(0, 4000)
+          rating: ratingNumber(rr), text: text.slice(0, 4000)
         });
       }
     }
     if (!schema && book && !out.annotation) out.annotation = description(n.shortDescription || n.short_description);
-    if (schema && book && Array.isArray(n.review)) for (const r of n.review) walk(r, depth + 1, "reviews");
     for (const [k, v] of Object.entries(n)) {
       if (v && typeof v === "object") walk(v, depth + 1, /^(reviews|review|comments|recenses)$/.test(k) ? "reviews" : null);
     }
   }
   walk(root, 0, null);
-}
-
-function readRating(a, out) {
-  if (out.rating == null) out.rating = ratingNumber(a.ratingValue ?? a.value);
-  if (out.ratings_count == null) out.ratings_count = countNumber(a.ratingCount ?? a.rating_count);
-  if (out.reviews_count == null) out.reviews_count = countNumber(a.reviewCount ?? a.review_count);
 }
 
 function mergeReviews(a, b) {
@@ -197,7 +219,6 @@ function bookLinks(html) {
   }
   return [...result];
 }
-
 function matchesBook(book, input) {
   if (input.isbn && book.isbn && digits(input.isbn) === digits(book.isbn)) return true;
   if (!input.title || !book.title) return false;
@@ -211,7 +232,6 @@ function matchesBook(book, input) {
   }
   return true;
 }
-
 function findReviewsLink(html, bookUrl) {
   const re = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
   let m;
@@ -224,7 +244,6 @@ function findReviewsLink(html, bookUrl) {
   }
   return null;
 }
-
 function safeLitresUrl(value, base) {
   try {
     const u = new URL(value, base || "https://www.litres.ru/");
