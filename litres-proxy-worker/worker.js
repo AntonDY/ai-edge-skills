@@ -19,11 +19,29 @@ export default {
     const mode = url.searchParams.get("mode") || "search";
 
     try {
+      if (url.pathname === "/ping" || mode === "ping") {
+        return json({ ok: true, pong: true, now: new Date().toISOString() }, 200, cors);
+      }
+
+      if (mode === "fetch-test") {
+        const target = "https://example.com/";
+        const started = Date.now();
+        const r = await fetch(target, { redirect: "follow" });
+        const text = await r.text();
+        return json({
+          ok: r.ok,
+          status: r.status,
+          elapsed_ms: Date.now() - started,
+          length: text.length
+        }, 200, cors);
+      }
+
       if (mode === "search") {
         const q = (url.searchParams.get("q") || "").trim();
         if (!q) return json({ error: "missing q" }, 400, cors);
 
         const target = "https://www.litres.ru/search/?q=" + encodeURIComponent(q);
+        const started = Date.now();
         const r = await fetch(target, {
           headers: {
             "User-Agent": "Mozilla/5.0",
@@ -32,10 +50,11 @@ export default {
           redirect: "follow"
         });
         const text = await r.text();
-        return new Response(text, {
-          status: r.status,
-          headers: { ...cors, "Content-Type": "text/html; charset=utf-8" }
-        });
+        const h = { ...cors, "Content-Type": "text/html; charset=utf-8" };
+        h["X-Proxy-Upstream-Status"] = String(r.status);
+        h["X-Proxy-Upstream-Ms"] = String(Date.now() - started);
+        h["X-Proxy-Upstream-Length"] = String(text.length);
+        return new Response(text, { status: r.status, headers: h });
       }
 
       if (mode === "page") {
@@ -47,6 +66,7 @@ export default {
           return json({ error: "host not allowed" }, 403, cors);
         }
 
+        const started = Date.now();
         const r = await fetch(target.toString(), {
           headers: {
             "User-Agent": "Mozilla/5.0",
@@ -55,10 +75,11 @@ export default {
           redirect: "follow"
         });
         const text = await r.text();
-        return new Response(text, {
-          status: r.status,
-          headers: { ...cors, "Content-Type": "text/html; charset=utf-8" }
-        });
+        const h = { ...cors, "Content-Type": "text/html; charset=utf-8" };
+        h["X-Proxy-Upstream-Status"] = String(r.status);
+        h["X-Proxy-Upstream-Ms"] = String(Date.now() - started);
+        h["X-Proxy-Upstream-Length"] = String(text.length);
+        return new Response(text, { status: r.status, headers: h });
       }
 
       return json({ error: "unknown mode" }, 400, cors);
